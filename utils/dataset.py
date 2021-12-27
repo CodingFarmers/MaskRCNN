@@ -7,6 +7,11 @@ from utils.util import *
 
 
 @DATASETS.register_module()
+class INSDataset(CocoDataset):
+    CLASSES = ('human', 'ball')
+
+
+@DATASETS.register_module()
 class DAMAGEDataset(CocoDataset):
     CLASSES = ('scratch', 'dent', 'crack', 'gap', 'paint')
 

@@ -687,3 +687,156 @@ class RandomAugment:
         for transform in numpy.random.choice(self.transform3, 1):
             results = transform(results)
         return results
+
+
+@PIPELINES.register_module()
+class GridDropout:
+    def __init__(self, use_h=True, use_w=True, rotate=1, offset=False, ratio=0.5, mode=1, prob=0.5):
+        self.use_h = use_h
+        self.use_w = use_w
+        self.rotate = rotate
+        self.offset = offset
+        self.ratio = ratio
+        self.mode = mode
+        self.st_prob = prob
+        self.prob = prob
+
+    def __call__(self, results):
+        img = results['img']
+        if numpy.random.rand() > self.prob:
+            return results
+        h = img.shape[0]
+        w = img.shape[1]
+        self.d1 = 2
+        self.d2 = min(h, w)
+        hh = int(1.5 * h)
+        ww = int(1.5 * w)
+        d = numpy.random.randint(self.d1, self.d2)
+        if self.ratio == 1:
+            self.l = numpy.random.randint(1, d)
+        else:
+            self.l = min(max(int(d * self.ratio + 0.5), 1), d - 1)
+        mask = numpy.ones((hh, ww), numpy.float32)
+        st_h = numpy.random.randint(d)
+        st_w = numpy.random.randint(d)
+        if self.use_h:
+            for i in range(hh // d):
+                s = d * i + st_h
+                t = min(s + self.l, hh)
+                mask[s:t, :] *= 0
+        if self.use_w:
+            for i in range(ww // d):
+                s = d * i + st_w
+                t = min(s + self.l, ww)
+                mask[:, s:t] *= 0
+
+        r = numpy.random.randint(self.rotate)
+        mask = Image.fromarray(numpy.uint8(mask))
+        mask = mask.rotate(r)
+        mask = numpy.asarray(mask)
+        mask = mask[(hh - h) // 2:(hh - h) // 2 + h, (ww - w) // 2:(ww - w) // 2 + w]
+
+        mask = mask.astype(numpy.float32)
+        if self.mode == 1:
+            mask = 1 - mask
+
+        # mask = mask.expand_as(img)
+        mask = numpy.expand_dims(mask, 2).repeat(3, axis=2)
+        if self.offset:
+            offset = 2 * (numpy.random.rand(h, w) - 0.5)
+            offset = (1 - mask) * offset
+            img = img * mask + offset
+        else:
+            img = img * mask
+        results['img'] = img
+        return results
+
+
+@PIPELINES.register_module()
+class TSCopyPaste:
+    def __init__(self, data_dir='../Dataset/Ins2021'):
+        self.data_dir = data_dir
+
+        self.crop_image_dir = 'c_images'
+        self.crop_label_dir = 'c_labels'
+
+        import glob
+        self.src_names_0 = glob.glob(f'{data_dir}/{self.crop_image_dir}/0/*.png')
+        self.src_names_1 = glob.glob(f'{data_dir}/{self.crop_image_dir}/1/*.png')
+
+        with open(f'{data_dir}/{self.crop_label_dir}/0.txt') as f:
+            self.labels = {}
+            for line in f.readlines():
+                line = line.rstrip().split(' ')
+                self.labels[line[0]] = line[1:]
+        with open(f'{data_dir}/{self.crop_label_dir}/1.txt') as f:
+            for line in f.readlines():
+                line = line.rstrip().split(' ')
+                self.labels[line[0]] = line[1:]
+
+    def paste(self, img):
+        gt_label = []
+        gt_masks = []
+        gt_boxes = []
+
+        dst_h, dst_w = img.shape[:2]
+        num_0 = numpy.random.randint(5, 15)
+        num_1 = numpy.random.randint(5, 15)
+        y_c_list = numpy.random.randint(dst_h // 2 - 256, dst_h // 2 + 256, num_0 + num_1)
+        x_c_list = numpy.random.randint(256, dst_w - 256, num_0 + num_1)
+        src_names = numpy.random.choice(self.src_names_0, num_0).tolist()
+        src_names.extend(numpy.random.choice(self.src_names_1, num_1).tolist())
+
+        mask_list = []
+        poly_list = []
+        src_img_list = []
+        src_name_list = []
+        for src_name in src_names:
+            poly = []
+            label = self.labels[basename(src_name)]
+            src_img = cv2.imread(src_name)
+            for i in range(0, len(label), 2):
+                poly.append([int(label[i]), int(label[i + 1])])
+            src_mask = numpy.zeros(src_img.shape, src_img.dtype)
+            cv2.fillPoly(src_mask, [numpy.array(poly)], (255, 255, 255))
+            mask_list.append(src_mask)
+            poly_list.append(poly)
+            src_img_list.append(src_img)
+            src_name_list.append(src_name)
+        for i, (x_c, y_c) in enumerate(zip(x_c_list, y_c_list)):
+            dst_poly = []
+            for p in poly_list[i]:
+                dst_poly.append([int(p[0] + x_c), int(p[1] + y_c)])
+            dst_mask = numpy.zeros(img.shape, img.dtype)
+            cv2.fillPoly(dst_mask, [numpy.array(dst_poly, int)], (255, 255, 255))
+            x_min, y_min, w, h = cv2.boundingRect(numpy.array([dst_poly], int))
+            gt_boxes.append([x_min, y_min, x_min + w, y_min + h])
+            src = src_img_list[i].copy()
+            h, w = src.shape[:2]
+            mask = mask_list[i].copy()
+            img[dst_mask > 0] = 0
+            img[y_c:y_c + h, x_c:x_c + w] += src * (mask > 0)
+            if 'human' in basename(src_name_list[i]):
+                gt_label.append(0)
+            else:
+                gt_label.append(1)
+            dst_point = []
+            for p in dst_poly:
+                dst_point.append(p[0])
+                dst_point.append(p[1])
+            gt_masks.append([dst_point])
+        return img, gt_label, gt_boxes, gt_masks
+
+    def __call__(self, results):
+        img = results['img']
+        img, label, boxes, masks = self.paste(img)
+
+        masks.extend(results['ann_info']['masks'])
+        label.extend(results['ann_info']['labels'].tolist())
+        boxes.extend(results['ann_info']['bboxes'].tolist())
+
+        results['img'] = img
+        results['ann_info']['labels'] = numpy.array(label, numpy.int64)
+        results['ann_info']['bboxes'] = numpy.array(boxes, numpy.float32)
+        results['ann_info']['masks'] = masks
+        return results
